@@ -1,0 +1,456 @@
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+#include <wiringSerial.h>
+#include <termios.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <ctype.h>
+//************************************************************************
+
+#define true (1==1)
+#define false !true
+#define READ_BUF_LEN 1024
+#define SEND_SMS_LEN 160
+#define MAX_STR_LEN 20
+#define MAXELEMENTS 10
+#define SERIAL_DEVICE "/dev/ttyAMA0"	//RaspberryPi 2 Serial
+#define SERIAL_BAUD 115200
+
+#define ACTION_START 1
+#define ACTION_STOP 2
+#define ACTION_REBOOT 3
+#define ACTION_ISUP 4
+#define ACTION_GETINFO 5
+#define ACTION_SHUTDOWN 6
+
+int commandReceived;
+int isStop;
+
+void processCommand();
+
+void upperStr(char *s) {
+	// Convert to upper case
+while(*s) {
+		*s = (char) toupper((unsigned char) *s);
+		s++;
+	}
+
+}
+
+//************************************************************************
+
+ 
+int fd;
+int SMSSentOK = 0; 	//flag SMS send Ok
+int isSending = false;   //Flag SMS is sending 
+char *authNumbers[5];   //pointer to array of  Authorized Phone Numbers
+
+struct send_routine_tool {
+		//structure to pass argument to threads
+	char *Msg;
+	char *numberToCall;
+};
+struct send_routine_tool tools;
+
+void rstBuffer(char *buffer) {
+	//empty receive buffer
+	int i;
+	for (i = 0; i < READ_BUF_LEN; i++)
+		buffer[i] = '\0';
+}
+
+int parseNumbers(char *authNumbStr) {
+	//convert list of authtorized numbers to an array
+	char* token, * tmp, * last_comma;
+	int i, j = 0, count = 0;
+    
+	//initialize array of pointers
+	for(i = 0 ; i < 5 ; i++)
+	    authNumbers[i] = (char *) calloc(20, sizeof(char));
+    
+	/* Count how many elements will be extracted. */
+	tmp = authNumbStr;
+	while (*tmp) {
+		if (*tmp == ',') {
+			count++;
+			last_comma = tmp;
+		}
+		tmp++;
+	}
+	if (count > 4) {
+		printf("Error: There are more than 5 phones numbers or problems with the List\n");
+		return -1;
+	}
+    
+	// Returns first token 
+	token = strtok(authNumbStr, ",");
+
+	// Keep extracting tokens while there is one delimiter present in the string. 
+	while(token != NULL) { 
+		authNumbers[j] = strdup(token); 
+		token = strtok(NULL, ","); 
+		j++;
+	}
+	return 1;
+}
+
+char *getPhoneNumber(char * buffer) {
+	//get phone number enclosed between " " and return them in an array
+	int i = 0, j = 0;
+	char *start, *end, *ret;
+	start = strchr(buffer, '\"');
+	if (start == NULL)
+		return NULL;
+	end = strchr(start + 1, '\"');
+	if (end == NULL)
+		return NULL;
+	
+	ret = (char*) calloc(20, sizeof(char));
+	for (i = 1; i < end - start; i++) {
+		ret[j] = start[i];
+		j++;
+	}
+
+	ret[j] = '\0';
+	
+	return ret;
+
+}
+	
+int isAuthNumber(char *number) {
+	//Check if calling number is in the authorized array of phone numbers
+	int i = 0;
+	while (authNumbers[i]) {
+		if (strcmp(authNumbers[i], number) == 0)
+			return 1;
+		i++;
+	}
+	
+	return -1;
+}
+
+static void *sendCMDfn(void *tool_in) {
+	//Send AT command to modem
+
+	struct send_routine_tool *tool = tool_in;
+	int wcnt;
+
+	SMSSentOK = 0;
+	//send AT Command
+	wcnt = write(fd, tool->Msg, strlen(tool->Msg));  
+
+	if (wcnt < 0) {
+		return NULL;
+	}
+	sleep(2);
+    
+	//flag end of thread
+	isSending = false;
+
+	return NULL;
+
+}
+
+int sendCMD(char *msg) {
+	// create thread to send AT command to modem
+	char msg1[SEND_SMS_LEN + 2];
+	pthread_t serialSend;
+	snprintf(msg1, SEND_SMS_LEN, "%s\r", msg);
+	tools.Msg = msg1;
+
+	isSending = true;
+
+	if (pthread_create(&serialSend, NULL, sendCMDfn, &tools)) {
+		printf("Error Creating thread\n");
+		return 1;
+	}
+
+	pthread_detach(serialSend);
+     
+	return 0;
+}
+
+static void writeSend(struct send_routine_tool *tool) {
+	// send SMS message
+	int wcnt;
+	char ATMsg[30];
+
+	SMSSentOK = 0;
+
+	
+	snprintf(ATMsg, 29, "AT+CMGS=\"%s\"\r", tool->numberToCall); 
+	//write AT Command + Number
+	wcnt = write(fd, ATMsg, strlen(ATMsg));  
+	
+	if(wcnt < 0) {
+		return;
+	}
+	
+	sleep(1);
+    
+	//Write message
+	wcnt = write(fd, tool->Msg, strlen(tool->Msg)); 
+	if (wcnt < 0) {
+		return;
+	}
+	sleep(1);
+
+	tcflush(fd, TCIOFLUSH);
+    
+}
+
+static void *sendSMSfn(void *tool_in)
+{
+	struct send_routine_tool *tool = tool_in;
+	//message must not be longer than 160char, if not carrier rejected (at leat in my carrier company)
+
+   //send AT Command 
+ 
+	writeSend(tool);
+   	
+	//flag  end of thread
+	isSending = false;
+
+	return NULL;
+
+}
+
+int sendSMS(char * msg)  
+{
+	//Create thread to send message
+	pthread_t serialSend;
+	char msg1[SEND_SMS_LEN + 2];
+
+	snprintf(msg1, SEND_SMS_LEN, "%s\x1A\r", msg);
+	tools.Msg = msg1;
+	
+	//flag  start of thread
+	isSending = true;
+
+	if (pthread_create(&serialSend, NULL, sendSMSfn, &tools)) {
+		printf("Error Creating thread\n");
+		return 1;
+	}
+
+	pthread_detach(serialSend);
+     
+	return 0;
+}
+
+void *receiving(void *ptr)
+{
+	//thread of receiving SMS 
+	int gotData = 0;
+	char buffer[READ_BUF_LEN];
+	int pos = 0;
+	double timeout = 0.5, elapsed;
+	clock_t start = 0;
+	int cmt = 0;
+	char *callingNumber;
+	
+	rstBuffer(buffer);
+
+	for (;;) {
+		
+		if(serialDataAvail(fd)) {
+			if (start == 0)
+				start = clock();
+
+			while (serialDataAvail(fd)) {
+				//printf ("%c", serialGetchar (fd)) ;
+				buffer[pos++] = (char) serialGetchar(fd);      
+				gotData = 1;
+			}
+		}
+
+		if (gotData) {
+			elapsed = ((double) clock() - (double) start) / CLOCKS_PER_SEC;
+			if (elapsed > timeout) {
+				//*** this is only for debug purpose. Print Message received on the screen.
+				printf("==>%s\n", buffer);
+				printf("********************************\n");
+				fflush(stdout);
+				//***
+				upperStr(buffer);
+                
+				if (strstr(buffer, "+CMGS:") != 0 || strstr(buffer, "OK") != 0)
+					SMSSentOK = 1;
+                
+				if (strstr(buffer, "+CMT") != 0)
+					cmt = 1;
+				
+				if (cmt) {
+					//if the sender number is not in the authorized list of phones, wait for another message
+					callingNumber = getPhoneNumber(buffer);
+					if (isAuthNumber(callingNumber) == -1) {
+						break;
+					}												
+					else {
+						tools.numberToCall = callingNumber; 	//save calling number if it is authorized to answer a message later
+					}	
+					//delete SMS once is in the buffer. My modem support only 50 messages
+					sendCMD("AT+CMGDA=\"DEL ALL\"\r");   // Command depends of the modem 
+	
+					//process mesagges received
+					if(strstr(buffer, "STOP SMS") != 0) {
+						commandReceived = ACTION_STOP;
+					}
+					if (strstr(buffer, "START SMS") != 0) {
+						commandReceived = ACTION_START;
+					}
+					if (strstr(buffer, "ISUP") != 0) {
+						commandReceived = ACTION_ISUP;
+					}
+					if (strstr(buffer, "REBOOT") != 0) {
+						commandReceived = ACTION_REBOOT;
+					}
+					if (strstr(buffer, "ERROR") != 0) {
+						//if modem send error, we can process it
+					}
+				}
+
+				//reset buffer and variales to start listenning again
+				rstBuffer(buffer);
+				pos = 0;
+				gotData = 0;
+				start = 0;		   
+				cmt = 0; 		
+			}
+		}
+	}
+	return NULL;
+}
+
+int setupSMS()
+{
+	//opem serial device and Setup modem
+	fd = serialOpen(SERIAL_DEVICE, SERIAL_BAUD);
+
+	if (fd < 0)
+	{
+		printf("Serial opening error\n");
+		return 1;
+	}
+    
+	pthread_t recThrd;
+	//printf("-----\n");
+	int thr = pthread_create(&recThrd, NULL, receiving, NULL);
+	//printf("%i",thr);
+	if(thr != 0)
+	{
+		printf("Error during creating serialReceiver thread.");
+		return 1;
+	}
+
+	//pthread_join(recThrd,(void **)&status);
+
+	pthread_detach(recThrd);
+
+	isSending = true;
+	//Setup SMS Store @ ME
+    
+	tools.Msg = "AT+CPMS=\"ME\"\r"; 	//choose the internal memory of the SIM card
+	sendCMDfn(&tools);
+	if (SMSSentOK == 0) {
+		printf("Error settting AT+CPMS=\"ME\". Abort\n");
+		return 1;
+	} else
+		SMSSentOK = 0;
+
+
+	tools.Msg = "AT+CNMI=2,2,0,0\r"; 	// to receive messages in the TE
+	sendCMDfn(&tools);
+	if (SMSSentOK == 0) {
+		printf("Error settting AT+CNMI=2,2,0,0. Abort\n");
+		return 1;
+	} else
+		SMSSentOK = 0;
+
+
+	tools.Msg = "AT+CMGF=1\r"; 	//receive and send message in text mode
+	sendCMDfn(&tools);
+	if (SMSSentOK == 0) {
+		printf("Error settting AT+CMGF=1. Abort\n");
+		return 1;
+	} else
+		SMSSentOK = 0;
+
+	isSending = false;
+	
+	return 0;
+}
+
+void processCommand()
+{
+	//Process all accepted message received. Add the cooamnd you need here
+	if (commandReceived == 0)
+		return;
+	//If SMS was stopped by a command, process only the START command
+	if(!isStop || commandReceived == ACTION_START)
+	{
+		switch (commandReceived) {
+		case ACTION_STOP:			//We stop te process of received messages
+			while (isSending) {}	//we don't want to send a message while another is in the sending process.
+			sendSMS("SMS Stoppped");
+			isStop = true;
+			printf("Stop received\n");
+			break;
+		case ACTION_START:			//We re-start te process of received messages
+			while (isSending) {}
+			sendSMS("SMS Started");
+			isStop = false;
+			printf("Started received\n"); 
+			break;
+		case ACTION_ISUP:			//Check if modem is receiving messages
+			while (isSending) {}
+			sendSMS("Up & Running");
+			printf("IsUp received\n"); 
+			break;
+		case ACTION_REBOOT:			
+			while (isSending) {}
+			sendSMS("SMS Rebooting");
+			printf("Reboot received\n");
+			while (isSending) {}
+			close(fd);
+			system("sudo reboot now");
+			break;
+		default:
+			break;
+		}
+	}
+	
+	commandReceived = 0;
+}
+
+
+char phonenumbers[] = "+XXXXXXXXXXXXX,+YYYYYYYYYY";  //Authorized Phone Numbers List 
+
+int main()
+{
+	//open and setup modem to receive SMS
+	fd = -1;
+	if (setupSMS() == 1) {
+		close(fd);
+		exit(1);
+	}
+	
+	//Process list of authorized phone numbers from where to receive SMS (maximum 5).
+	parseNumbers(phonenumbers); 
+    
+	printf("Waiting SMS ...\n\n");
+	
+	//this is the main loop, you have to insert your code inside processcommand() to process SMS
+	for(;  ;) {
+		//process command sent by SMS to your modem
+		processCommand();
+		sleep(1);
+	}
+	
+	printf("\n");
+	return 0 ;
+	
+	
+}
